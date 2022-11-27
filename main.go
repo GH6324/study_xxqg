@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/johlanse/study_xxqg/utils/stop"
 	"io"
 	"math/rand"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -24,6 +26,7 @@ import (
 	"github.com/huoxue1/xdaemon"
 
 	"github.com/johlanse/study_xxqg/conf"
+	"github.com/johlanse/study_xxqg/lib/state"
 	"github.com/johlanse/study_xxqg/utils"
 	// "github.com/johlanse/study_xxqg/gui"
 	"github.com/johlanse/study_xxqg/lib"
@@ -43,7 +46,9 @@ var (
 var VERSION = "unknown"
 
 func init() {
-	runBack()
+	if runtime.GOOS != "windows" {
+		runBack()
+	}
 	fmt.Printf("\033[1;31;40m%s\033[0m\n\n", "******************************************************************")
 
 	fmt.Printf("\033[1;31;40m%s\033[0m\n\n", "软件仅可用户学习和个人使用，禁止用于任何商业活动！！！！")
@@ -120,7 +125,7 @@ var (
 func init() {
 	_, err := os.Stat(`./config/`)
 	if err != nil {
-		os.Mkdir("./config/", 0666) //nolint:errcheck
+		_ = os.Mkdir("./config/", 0666)
 		return
 	}
 }
@@ -146,6 +151,10 @@ func main() {
 	engine := web.RouterInit()
 	go func() {
 		h := http.NewServeMux()
+		if config.QQ.Enable {
+			h.Handle("/qq", push.InitQQ())
+			log.Infoln(fmt.Sprintf("已开启qq配置,监听地址： ==》 %v:%v", config.Web.Host, config.Web.Port))
+		}
 		if config.Web.Enable {
 			log.Infoln(fmt.Sprintf("已开启web配置，web监听地址 ==> %v:%v", config.Web.Host, config.Web.Port))
 			h.Handle("/", engine)
@@ -154,7 +163,7 @@ func main() {
 			log.Infoln(fmt.Sprintf("已开启wechat公众号配置,监听地址： ==》 %v:%v", config.Web.Host, config.Web.Port))
 			h.HandleFunc("/wx", push.HandleWechat)
 		}
-		if config.Web.Enable || config.Wechat.Enable {
+		if config.Web.Enable || config.Wechat.Enable || config.QQ.Enable {
 			err := http.ListenAndServe(fmt.Sprintf("%s:%d", config.Web.Host, config.Web.Port), h)
 			if err != nil {
 				return
@@ -182,7 +191,7 @@ func main() {
 					log.Infoln(fmt.Sprintf("随机延迟%d分钟", r))
 					time.Sleep(time.Duration(r) * time.Minute)
 				}
-				do("cron")
+				do()
 			})
 			if err != nil {
 				log.Errorln(err.Error())
@@ -209,63 +218,22 @@ func main() {
 		}
 		c2.Run()
 	}
-	inittask()
+	initTask()
 	model.SetPush(getPush)
 	if now {
-		do("cron")
+		do()
 	}
-	if !config.TG.Enable && config.Cron == "" && !config.Wechat.Enable {
-		log.Infoln("已采用普通学习模式")
-		do("normal")
-	} else {
-		// gui.InitWindow()
-		select {}
-	}
+	stop.Stop()
+
 }
 
-func do(m string) {
+func do() {
 
 	log.Infoln("检测到模式", config.Model)
 
 	getPush := push.GetPush(config)
 	getPush("", "flush", "学习强国助手已上线")
-
-	var user *model.User
 	users, _ := model.Query()
-	study := func(core2 *lib.Core, u *model.User) {
-		defer func() {
-			err := recover()
-			if err != nil {
-				log.Errorln("学习过程异常")
-				log.Errorln(err)
-			}
-		}()
-		startTime := time.Now()
-
-		core2.LearnArticle(u)
-
-		core2.LearnVideo(u)
-
-		core2.LearnVideo(u)
-		if config.Model == 2 {
-			core2.RespondDaily(u, "daily")
-		} else if config.Model == 3 {
-			core2.RespondDaily(u, "daily")
-			core2.RespondDaily(u, "weekly")
-			core2.RespondDaily(u, "special")
-		}
-		endTime := time.Now()
-		score, err := lib.GetUserScore(u.ToCookies())
-		if err != nil {
-			log.Errorln("获取成绩失败")
-			log.Debugln(err.Error())
-			return
-		}
-
-		score, _ = lib.GetUserScore(u.ToCookies())
-		message := fmt.Sprintf("%v 学习完成,用时%.1f分钟\n%v", u.Nick, endTime.Sub(startTime).Minutes(), lib.FormatScoreShort(score))
-		core2.Push(u.PushId, "flush", message)
-	}
 
 	failUser, _ := model.QueryFailUser()
 	for _, user := range failUser {
@@ -279,26 +247,34 @@ func do(m string) {
 			}
 			c.Init()
 			defer c.Quit()
-			study(c, newUser)
+			lib.Study(c, newUser)
 		}(user)
 	}
 
-	// 用户小于1时自动登录
-	if len(users) < 1 {
-		log.Infoln("未检测到有效用户信息，将采用登录模式")
-		core := &lib.Core{ShowBrowser: config.ShowBrowser, Push: getPush}
-		u, err := core.L(config.Retry.Times, "")
-		if err != nil {
-			log.Errorln(err.Error())
-			return
+	s := &sync.WaitGroup{}
+	// 如果为定时模式则直接循环所以用户依次运行
+
+	if config.PoolSize == 1 {
+		for _, user := range users {
+			if state.IsStudy(user.Uid) {
+				log.Infoln("检测到该用户已在学习中！")
+				continue
+			} else {
+				core := &lib.Core{ShowBrowser: config.ShowBrowser, Push: getPush}
+				core.Init()
+				state.Add(user.Uid, core)
+				lib.Study(core, user)
+				core.Quit()
+				state.Delete(user.Uid)
+			}
+
 		}
-		user = u
 	} else {
-		s := &sync.WaitGroup{}
-		// 如果为定时模式则直接循环所以用户依次运行
-		if m == "cron" {
-			for _, u := range users {
-				//study(core, u)
+		for _, u := range users {
+			if state.IsStudy(u.Uid) {
+				log.Infoln("检测到该用户已在学习中！")
+				continue
+			} else {
 				core := &lib.Core{ShowBrowser: config.ShowBrowser, Push: getPush}
 				core.Init()
 				t := &Task{
@@ -306,71 +282,16 @@ func do(m string) {
 					User: u,
 					wg:   s,
 				}
+
 				run(t)
 				s.Add(1)
 			}
-			s.Wait()
-			if len(users) < 1 {
-				core := &lib.Core{ShowBrowser: config.ShowBrowser, Push: getPush}
-
-				core.Init()
-				defer core.Quit()
-				user, err := core.L(config.Retry.Times, "")
-				if err != nil {
-					core.Push(user.PushId, "msg", "登录超时")
-					return
-				}
-				study(core, user)
-			}
-			log.Infoln("定时任务执行完成")
-			return
 		}
-
-		for i, user := range users {
-			log.Infoln("序号：", i+1, "   ===> ", user.Nick)
-		}
-		log.Infoln("请输入对应序号选择对应账户，输入0添加用户：")
-
-		inputChan := make(chan int, 1)
-		go func(c chan int) {
-			var i int
-			_, _ = fmt.Scanln(&i)
-			c <- i
-		}(inputChan)
-
-		var i int
-		select {
-		case i = <-inputChan:
-			log.Infoln("已获取到输入")
-		case <-time.After(time.Minute):
-			log.Errorln("获取输入超时，默认选择第一个用户")
-			if len(users) < 1 {
-				return
-			} else {
-				i = 1
-			}
-		}
-
-		if i == 0 {
-			core := &lib.Core{ShowBrowser: config.ShowBrowser, Push: getPush}
-			u, err := core.L(config.Retry.Times, "")
-			if err != nil {
-				log.Errorln(err.Error())
-				return
-			}
-			user = u
-		} else {
-			user = users[i-1]
-			log.Infoln("已选择用户: ", users[i-1].Nick)
-		}
+		s.Wait()
 	}
+	log.Infoln("定时任务执行完成")
+	return
 
-	core := &lib.Core{ShowBrowser: config.ShowBrowser, Push: getPush}
-
-	core.Init()
-	defer core.Quit()
-	study(core, user)
-	core.Push(user.PushId, "flush", "")
 }
 
 func runBack() {
